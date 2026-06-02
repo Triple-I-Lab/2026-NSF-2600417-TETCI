@@ -76,6 +76,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs",      default=5,   type=int)
     parser.add_argument("--lr",          default=0.01, type=float,
                         help="Client learning rate (default: 0.01)")
+    parser.add_argument("--participation", default=0.4, type=float,
+                        help="Fraction of clients per round (default: 0.4)")
     parser.add_argument("--security",    default=128, type=int,
                         choices=[128, 192, 256])
     parser.add_argument("--run_tag",     default=None, type=str)
@@ -95,15 +97,12 @@ def run_train(
     ckks_params: CKKSParams,
     scheme: CKKSScheme,
 ) -> Dict:
-    """
-    Single training run: proposed FL-HE method on one model/dataset combo.
-    Returns metrics dict.
-    """
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     print(f"\n[train] model={model_name}  dataset={args.dataset}  "
-          f"clients={args.clients}  rounds={args.rounds}  epochs={args.epochs}  "
+          f"clients={args.clients}  participation={args.participation:.0%}  "
+          f"rounds={args.rounds}  epochs={args.epochs}  "
           f"lr={args.lr}  attack={args.attack}({args.attack_rate:.0%})")
 
     # Data
@@ -149,9 +148,9 @@ def run_train(
     server = FLServer(
         ServerConfig(
             n_clients=args.clients,
-            participation_rate=0.4,
+            participation_rate=args.participation,
             distance_threshold=2.0,
-            min_clients_per_round=max(2, int(args.clients * 0.4 * 0.5)),
+            min_clients_per_round=max(2, int(args.clients * args.participation * 0.5)),
             security_bits=args.security,
         ),
         copy.deepcopy(base_model),
@@ -198,7 +197,7 @@ def run_train(
         m = coordinator.run(
             r,
             val_dataset=val_ds,
-            participation_rate=0.4,
+            participation_rate=args.participation,
             track_client_acc=track_clients,
         )
         metrics_history.append(m)
@@ -393,7 +392,7 @@ def run_ablation(
             abl_iter = tqdm(range(args.rounds), desc=f"    {vname}", unit="round",
                             ncols=80, leave=False) if TQDM_AVAILABLE else range(args.rounds)
             for r in abl_iter:
-                m = coordinator.run(r, val_dataset=val_ds, participation_rate=0.4)
+                m = coordinator.run(r, val_dataset=val_ds, participation_rate=args.participation)
                 acc_list.append(m.get("val_acc", 0))
                 if TQDM_AVAILABLE:
                     abl_iter.set_postfix({"acc": f"{acc_list[-1]:.4f}"})
@@ -488,7 +487,7 @@ def run_compare(
     prop_iter = tqdm(range(args.rounds), desc="  Proposed", unit="round",
                      ncols=80) if TQDM_AVAILABLE else range(args.rounds)
     for r in prop_iter:
-        m = proposed_coord.run(r, val_dataset=val_ds, participation_rate=0.4)
+        m = proposed_coord.run(r, val_dataset=val_ds, participation_rate=args.participation)
         proposed_accs.append(m.get("val_acc", 0))
         if TQDM_AVAILABLE:
             prop_iter.set_postfix({"acc": f"{proposed_accs[-1]:.4f}"})
