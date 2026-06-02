@@ -2,7 +2,6 @@
 federated.py
 ============
 Federated learning orchestration for the FL-HE framework.
-
 Run this file directly for 3 built-in test cases:
   python federated.py [--mode simulate_he | tenseal]
 """
@@ -139,10 +138,6 @@ class FLClient:
       2. Train locally for n_local_epochs using Taylor-based diagonal gradient
       3. Encrypt the gradient update (Algorithm 3)
       4. Return encrypted update to server
-
-    Byzantine clients inject Gaussian noise into their updates at
-    specified epochs (fixed-position) or random intervals (random-position),
-    matching the attack scenarios in Section V-A of the paper.
     """
 
     def __init__(
@@ -172,17 +167,6 @@ class FLClient:
         self._set_flat_params(torch.tensor(global_params, dtype=torch.float32))
 
     def local_train(self, current_round: int) -> Ciphertext:
-        """
-        Run local training using Taylor-based diagonal gradient approximation
-        and return the encrypted accumulated gradient update.
-
-        For each epoch and each batch:
-          1. Build ModelLossWrapper around current model state + batch
-          2. Compute gradient via direct backprop (fast path)
-          3. Compute diagonal Hessian via finite differences
-          4. Apply Taylor gradient step: θ ← θ - lr*(∇L + D*(θ-θ_t))
-        After all local epochs, encrypt Δθ = θ_final - θ_global and return.
-        """
         self._local_round = current_round
         theta_t   = self._get_flat_params().clone()
         criterion = nn.CrossEntropyLoss()
@@ -195,7 +179,6 @@ class FLClient:
         )
 
         # Compute diagonal Hessian once per round on a single batch
-        # (very expensive: n_params forward passes — do NOT recompute per batch)
         first_batch = next(iter(loader))
         x_init, y_init = first_batch
         wrapper_init  = ModelLossWrapper(self.model, x_init, y_init, criterion)
@@ -214,8 +197,6 @@ class FLClient:
                 grad_t = wrapper.compute_gradient_direct().double()
 
                 # Taylor correction: D(θ_t) * (θ - θ_t)
-                # Clip diagonal to [0, max_diag] — negative curvature is
-                # non-convex and destabilises training
                 max_diag    = 10.0
                 diag_clip   = diag_t.clamp(0.0, max_diag)
                 delta_theta = theta_cur - theta_t.double()
@@ -238,21 +219,6 @@ class FLClient:
         theta_final = self._get_flat_params()
         delta = (theta_final - theta_t).detach().cpu().numpy()
 
-        # --- DEBUG: signal vs noise diagnostic ---
-        if self.config.client_id == 0 and current_round < 3:
-            delta_norm    = float(np.linalg.norm(delta))
-            delta_max     = float(np.max(np.abs(delta)))
-            ct_debug      = self.scheme.encrypt(delta)
-            recovered     = self.scheme.decrypt(ct_debug)
-            noise_norm    = float(np.linalg.norm(recovered - delta))
-            snr           = delta_norm / (noise_norm + 1e-12)
-            print(f"\n  [DEBUG client=0 round={current_round}]"
-                  f"  delta_norm={delta_norm:.6f}"
-                  f"  delta_max={delta_max:.6f}"
-                  f"  noise_norm={noise_norm:.6f}"
-                  f"  SNR={snr:.2f}")
-        # --- END DEBUG ---
-
         # Byzantine attack injection
         if self.config.byzantine:
             delta = self._inject_attack(delta, current_round)
@@ -264,7 +230,7 @@ class FLClient:
         return len(self.dataset)
 
     # ------------------------------------------------------------------
-    # Attack injection (Section V-A)
+    # Attack injection
     # ------------------------------------------------------------------
 
     def _inject_attack(self, delta: np.ndarray, current_round: int) -> np.ndarray:
@@ -309,7 +275,7 @@ class FLClient:
 
 
 # ---------------------------------------------------------------------------
-# Server — proposed method (Algorithms 1 & 2)
+# Server
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -345,7 +311,6 @@ class FLServer:
         self.scheme = scheme
         self.ops = HomomorphicOps(scheme)
         self.round_metrics: List[dict] = []
-        self._debug_rounds: int = 0
 
     # ------------------------------------------------------------------
     # Byzantine-resilient client selection
@@ -357,7 +322,7 @@ class FLServer:
         n_select: int,
     ) -> List[int]:
         """
-        Select clients based on encrypted distance filtering (Algorithm 2).
+        Select clients based on encrypted distance filtering.
 
         Computes pairwise squared distances between encrypted updates,
         filters outliers beyond threshold τ, returns selected client IDs.
@@ -375,7 +340,7 @@ class FLServer:
         if len(client_ids) <= n_select:
             return client_ids
 
-        # Decrypt distances only (not gradients) — server learns distances, not updates
+        # Decrypt distances only
         distances: Dict[int, float] = {}
         ref_id = client_ids[0]
         ref_ct = client_updates[ref_id]
@@ -402,7 +367,7 @@ class FLServer:
         return selected[:n_select]
 
     # ------------------------------------------------------------------
-    # Algorithm 1: Secure aggregation
+    # Secure aggregation
     # ------------------------------------------------------------------
 
     def aggregate(
@@ -420,7 +385,7 @@ class FLServer:
         ----------
         client_updates : encrypted gradient updates
         dataset_sizes  : number of samples per client
-        selected_ids   : clients chosen by Algorithm 2
+        selected_ids   : clients chosen
 
         Returns
         -------
@@ -432,8 +397,7 @@ class FLServer:
             dataset_sizes[cid] / total_samples for cid in selected_ids
         ]
 
-        # Weighted sum in encrypted domain — chunking handled transparently
-        # by HomomorphicOps and CKKSScheme.decrypt
+        # Weighted sum in encrypted domain
         agg_ct = self.ops.he_weighted_sum(selected_updates, weights)
         return self.scheme.decrypt(agg_ct)
 
@@ -441,11 +405,8 @@ class FLServer:
     # Model update
     # ------------------------------------------------------------------
 
-    def apply_update(self, delta: np.ndarray, debug: bool = False) -> None:
-        """Apply aggregated gradient update to global model."""
-        if debug:
-            print(f"  [DEBUG server] aggregated delta_norm={float(np.linalg.norm(delta)):.6f}"
-                  f"  delta_max={float(np.max(np.abs(delta))):.6f}")
+    def apply_update(self, delta: np.ndarray) -> None:
+        """Apply aggregated update to global model."""
         flat    = self._get_flat_params()
         updated = flat + torch.tensor(delta, dtype=torch.float32)
         self._set_flat_params(updated)
@@ -500,7 +461,7 @@ class FLServer:
 
 
 # ---------------------------------------------------------------------------
-# FedAvg baseline server (no encryption, no Byzantine defense)
+# FedAvg baseline server
 # ---------------------------------------------------------------------------
 
 class FedAvgServer:
@@ -573,15 +534,7 @@ class FedAvgServer:
 # ---------------------------------------------------------------------------
 
 class FederatedRound:
-    """
-    Coordinates one complete FL round:
-      1. Server broadcasts global model
-      2. Selected clients train locally and return encrypted updates
-      3. Server filters (Algorithm 2) and aggregates (Algorithm 1)
-      4. Server applies update and evaluates
-
-    Works for both FLServer (proposed) and FedAvgServer (baseline).
-    """
+    """Coordinates one FL round: broadcast → train → aggregate → evaluate."""
 
     def __init__(
         self,
@@ -602,69 +555,105 @@ class FederatedRound:
         round_idx: int,
         val_dataset: Optional[torch.utils.data.Dataset] = None,
         participation_rate: float = 0.4,
+        track_client_acc: bool = False,
     ) -> dict:
         """
         Execute one FL round.
 
-        Returns
-        -------
-        dict  round metrics: {round, n_selected, val_loss, val_acc, duration_s}
+        Returns dict with keys:
+            round, n_participating, val_loss, val_acc, duration_s,
+            client_accs (if track_client_acc=True)
         """
         t0 = time.time()
         global_params = self.server.get_model_params()
 
         # Sample participating clients
-        n_participate = max(
-            1, int(len(self.clients) * participation_rate)
-        )
+        n_participate = max(1, int(len(self.clients) * participation_rate))
         participating = np.random.choice(
             len(self.clients), size=n_participate, replace=False
         ).tolist()
 
+        # Per-client accuracy before local training (optional)
+        client_accs: Dict[int, float] = {}
+        if track_client_acc and val_dataset is not None:
+            for idx in participating:
+                client = self.clients[idx]
+                client.receive_model(global_params)
+                # Evaluate client model on val set using server's evaluate logic
+                _, acc = self._evaluate_model(client.model, val_dataset)
+                client_accs[idx] = round(acc, 4)
+
         # Broadcast and collect updates
         updates: Dict[int, any] = {}
-        sizes:   Dict[int, int]  = {}
-
+        sizes:   Dict[int, int] = {}
         for idx in participating:
             client = self.clients[idx]
-            client.receive_model(global_params)
+            if not track_client_acc:
+                client.receive_model(global_params)
             update = client.local_train(round_idx)
             updates[idx] = update
-            sizes[idx] = client.dataset_size()
+            sizes[idx]   = client.dataset_size()
 
         # Aggregate
         if self.use_fedavg:
-            # FedAvg: decrypt on the fly (updates are already np.ndarray for FedAvg clients)
             plain_deltas = {
-                cid: self.scheme.decrypt(ct) if isinstance(ct, Ciphertext)
-                     else ct
+                cid: self.scheme.decrypt(ct) if isinstance(ct, Ciphertext) else ct
                 for cid, ct in updates.items()
             }
             delta = self.server.aggregate(plain_deltas, sizes)
         else:
-            # Proposed: Byzantine selection then encrypted aggregation
-            n_select = max(self.server.config.min_clients_per_round,
-                           int(n_participate * 0.8))
-            selected = self.server.select_clients(updates, n_select)
+            n_select = max(
+                self.server.config.min_clients_per_round,
+                int(n_participate * 0.8),
+            )
+            # Skip Byzantine selection when no attack — saves pairwise distance computation
+            has_attack = any(
+                self.clients[idx].config.byzantine for idx in participating
+            )
+            if has_attack:
+                selected = self.server.select_clients(updates, n_select)
+            else:
+                selected = list(updates.keys())[:n_select]
             delta = self.server.aggregate(updates, sizes, selected)
 
-        debug_round = hasattr(self.server, 'config') and getattr(self.server, '_debug_rounds', 0) < 3
-        self.server.apply_update(delta, debug=debug_round)
-        if debug_round and hasattr(self.server, '_debug_rounds'):
-            self.server._debug_rounds = getattr(self.server, '_debug_rounds', 0) + 1
+        self.server.apply_update(delta)
 
-        # Evaluate
+        # Round metrics
         metrics = {
-            "round": round_idx,
+            "round":          round_idx,
             "n_participating": n_participate,
-            "duration_s": round(time.time() - t0, 3),
+            "duration_s":     round(time.time() - t0, 3),
         }
         if val_dataset is not None:
             loss, acc = self.server.evaluate(val_dataset)
             metrics["val_loss"] = round(loss, 6)
             metrics["val_acc"]  = round(acc,  6)
+        if track_client_acc:
+            metrics["client_accs"] = client_accs
 
         return metrics
+
+    @staticmethod
+    def _evaluate_model(
+        model: nn.Module,
+        dataset: torch.utils.data.Dataset,
+        batch_size: int = 64,
+    ) -> Tuple[float, float]:
+        """Evaluate a model on a dataset, returns (loss, accuracy)."""
+        loader    = torch.utils.data.DataLoader(dataset, batch_size=batch_size)
+        criterion = nn.CrossEntropyLoss()
+        model.eval()
+        total_loss, correct, total = 0.0, 0, 0
+        with torch.no_grad():
+            for x, y in loader:
+                out  = model(x)
+                loss = criterion(out, y)
+                total_loss += loss.item() * len(y)
+                pred = out.argmax(dim=1)
+                correct += (pred == y).sum().item()
+                total   += len(y)
+        model.train()
+        return total_loss / max(total, 1), correct / max(total, 1)
 
 
 # ---------------------------------------------------------------------------

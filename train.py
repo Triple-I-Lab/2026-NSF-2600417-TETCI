@@ -7,7 +7,7 @@ CLI flags:
   --mode         simulate_he | tenseal            (default: simulate_he)
   --experiment   train | ablation | compare       (default: train)
   --attack       none | fixed | random            (default: none)
-  --attack_rate  0.0-0.5                          (default: 0.1)
+  --attack_rate  0.0-0.5                          (default: 0.0)
   --clients      int                              (default: 10)
   --rounds       int                              (default: 20)
   --epochs       int                              (default: 5)
@@ -70,10 +70,12 @@ def parse_args() -> argparse.Namespace:
                         choices=["train", "ablation", "compare"])
     parser.add_argument("--attack",      default="none",
                         choices=["none", "fixed", "random"])
-    parser.add_argument("--attack_rate", default=0.1, type=float)
+    parser.add_argument("--attack_rate", default=0.0, type=float)
     parser.add_argument("--clients",     default=10,  type=int)
     parser.add_argument("--rounds",      default=20,  type=int)
     parser.add_argument("--epochs",      default=5,   type=int)
+    parser.add_argument("--lr",          default=0.01, type=float,
+                        help="Client learning rate (default: 0.01)")
     parser.add_argument("--security",    default=128, type=int,
                         choices=[128, 192, 256])
     parser.add_argument("--run_tag",     default=None, type=str)
@@ -101,8 +103,8 @@ def run_train(
     np.random.seed(args.seed)
 
     print(f"\n[train] model={model_name}  dataset={args.dataset}  "
-          f"clients={args.clients}  rounds={args.rounds}  "
-          f"attack={args.attack}({args.attack_rate:.0%})")
+          f"clients={args.clients}  rounds={args.rounds}  epochs={args.epochs}  "
+          f"lr={args.lr}  attack={args.attack}({args.attack_rate:.0%})")
 
     # Data
     print(f"  Loading data...")
@@ -132,7 +134,7 @@ def run_train(
         cfg = ClientConfig(
             client_id=i,
             n_local_epochs=args.epochs,
-            learning_rate=0.01,
+            learning_rate=args.lr,
             byzantine=is_byz,
             attack_type=args.attack if is_byz else "none",
             attack_noise_std=0.1,
@@ -175,6 +177,9 @@ def run_train(
     metrics_history = []
     n_rounds = args.rounds - start_round
 
+    # Track best accuracy
+    best_acc = 0.0
+
     if TQDM_AVAILABLE:
         pbar = tqdm(
             range(start_round, args.rounds),
@@ -188,22 +193,64 @@ def run_train(
         rounds_iter = range(start_round, args.rounds)
 
     for r in rounds_iter:
-        m = coordinator.run(r, val_dataset=val_ds, participation_rate=0.4)
+        # Track per-client accuracy every 5 rounds to reduce overhead
+        track_clients = (r % 5 == 0) or (r == args.rounds - 1)
+        m = coordinator.run(
+            r,
+            val_dataset=val_ds,
+            participation_rate=0.4,
+            track_client_acc=track_clients,
+        )
         metrics_history.append(m)
 
         val_loss = m.get("val_loss", 0)
         val_acc  = m.get("val_acc",  0)
         dur      = m["duration_s"]
+        best_acc = max(best_acc, val_acc)
+
+        # Per-client accuracy summary (only on tracking rounds)
+        client_accs  = m.get("client_accs", {})
+        has_client   = bool(client_accs)
+        if has_client:
+            accs        = list(client_accs.values())
+            client_mean = float(np.mean(accs))
+            client_min  = float(np.min(accs))
+            client_max  = float(np.max(accs))
+        else:
+            client_mean = client_min = client_max = None
 
         if TQDM_AVAILABLE:
-            pbar.set_postfix({
+            postfix = {
                 "loss": f"{val_loss:.4f}",
                 "acc":  f"{val_acc:.4f}",
+                "best": f"{best_acc:.4f}",
                 "t":    f"{dur}s",
-            })
+            }
+            if has_client:
+                postfix["c_mean"] = f"{client_mean:.4f}"
+            pbar.set_postfix(postfix)
         else:
+            client_str = (
+                f"  clients[{len(client_accs)}]: "
+                f"min={client_min:.3f} mean={client_mean:.3f} max={client_max:.3f}"
+                if has_client else ""
+            )
             print(f"  Round {r+1:3d}/{args.rounds}  "
-                  f"loss={val_loss:.4f}  acc={val_acc:.4f}  t={dur}s")
+                  f"loss={val_loss:.4f}  acc={val_acc:.4f}  best={best_acc:.4f}"
+                  f"{client_str}  t={dur}s")
+
+        # Print per-round summary above progress bar
+        if TQDM_AVAILABLE:
+            client_str = (
+                f"  clients[{len(client_accs)}]: "
+                f"min={client_min:.3f} mean={client_mean:.3f} max={client_max:.3f}"
+                if has_client else ""
+            )
+            tqdm.write(
+                f"  Round {r+1:3d}/{args.rounds}  "
+                f"loss={val_loss:.4f}  acc={val_acc:.4f}  best={best_acc:.4f}"
+                f"{client_str}  t={dur}s"
+            )
 
         # Checkpoint every 10 rounds
         if (r + 1) % 10 == 0:
@@ -237,10 +284,7 @@ def run_ablation(
     ckks_params: CKKSParams,
     scheme: CKKSScheme,
 ) -> Dict:
-    """
-    Ablation study
-    Attack: 20% Byzantine, random-position.
-    """
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -272,7 +316,7 @@ def run_ablation(
             cfg = ClientConfig(
                 client_id=i,
                 n_local_epochs=args.epochs,
-                learning_rate=0.01,
+                learning_rate=args.lr,
                 byzantine=is_byz,
                 attack_type=byz_attack if is_byz else "none",
                 attack_noise_std=0.1,
@@ -411,7 +455,7 @@ def run_compare(
             cfg = ClientConfig(
                 client_id=i,
                 n_local_epochs=args.epochs,
-                learning_rate=0.01,
+                learning_rate=args.lr,
                 byzantine=is_byz,
                 attack_type=args.attack if is_byz else "none",
                 attack_noise_std=0.1,
@@ -673,6 +717,8 @@ def _test_case_3_compare_run(simulate: bool):
 
 if __name__ == "__main__":
     import sys
+
+    # Self-test mode: triggered only by --test flag or no args at all
     is_test = (
         len(sys.argv) == 1
         or "--test" in sys.argv
