@@ -2,6 +2,9 @@
 federated.py
 ============
 Federated learning orchestration for the FL-HE framework.
+
+Run this file directly for 3 built-in test cases:
+  python federated.py [--mode simulate_he | tenseal]
 """
 
 from __future__ import annotations
@@ -130,6 +133,16 @@ class ClientConfig:
 class FLClient:
     """
     Federated learning client with encrypted gradient updates.
+
+    Responsibilities:
+      1. Receive global model parameters from server
+      2. Train locally for n_local_epochs using Taylor-based diagonal gradient
+      3. Encrypt the gradient update (Algorithm 3)
+      4. Return encrypted update to server
+
+    Byzantine clients inject Gaussian noise into their updates at
+    specified epochs (fixed-position) or random intervals (random-position),
+    matching the attack scenarios in Section V-A of the paper.
     """
 
     def __init__(
@@ -162,6 +175,13 @@ class FLClient:
         """
         Run local training using Taylor-based diagonal gradient approximation
         and return the encrypted accumulated gradient update.
+
+        For each epoch and each batch:
+          1. Build ModelLossWrapper around current model state + batch
+          2. Compute gradient via direct backprop (fast path)
+          3. Compute diagonal Hessian via finite differences
+          4. Apply Taylor gradient step: θ ← θ - lr*(∇L + D*(θ-θ_t))
+        After all local epochs, encrypt Δθ = θ_final - θ_global and return.
         """
         self._local_round = current_round
         theta_t   = self._get_flat_params().clone()
@@ -174,7 +194,8 @@ class FLClient:
             shuffle=True,
         )
 
-        # Compute diagonal Hessian once per round
+        # Compute diagonal Hessian once per round on a single batch
+        # (very expensive: n_params forward passes — do NOT recompute per batch)
         first_batch = next(iter(loader))
         x_init, y_init = first_batch
         wrapper_init  = ModelLossWrapper(self.model, x_init, y_init, criterion)
@@ -192,7 +213,9 @@ class FLClient:
                 # Fast gradient via backprop
                 grad_t = wrapper.compute_gradient_direct().double()
 
-                # Taylor correction
+                # Taylor correction: D(θ_t) * (θ - θ_t)
+                # Clip diagonal to [0, max_diag] — negative curvature is
+                # non-convex and destabilises training
                 max_diag    = 10.0
                 diag_clip   = diag_t.clamp(0.0, max_diag)
                 delta_theta = theta_cur - theta_t.double()
@@ -215,6 +238,21 @@ class FLClient:
         theta_final = self._get_flat_params()
         delta = (theta_final - theta_t).detach().cpu().numpy()
 
+        # --- DEBUG: signal vs noise diagnostic ---
+        if self.config.client_id == 0 and current_round < 3:
+            delta_norm    = float(np.linalg.norm(delta))
+            delta_max     = float(np.max(np.abs(delta)))
+            ct_debug      = self.scheme.encrypt(delta)
+            recovered     = self.scheme.decrypt(ct_debug)
+            noise_norm    = float(np.linalg.norm(recovered - delta))
+            snr           = delta_norm / (noise_norm + 1e-12)
+            print(f"\n  [DEBUG client=0 round={current_round}]"
+                  f"  delta_norm={delta_norm:.6f}"
+                  f"  delta_max={delta_max:.6f}"
+                  f"  noise_norm={noise_norm:.6f}"
+                  f"  SNR={snr:.2f}")
+        # --- END DEBUG ---
+
         # Byzantine attack injection
         if self.config.byzantine:
             delta = self._inject_attack(delta, current_round)
@@ -226,7 +264,7 @@ class FLClient:
         return len(self.dataset)
 
     # ------------------------------------------------------------------
-    # Attack injection
+    # Attack injection (Section V-A)
     # ------------------------------------------------------------------
 
     def _inject_attack(self, delta: np.ndarray, current_round: int) -> np.ndarray:
@@ -271,7 +309,7 @@ class FLClient:
 
 
 # ---------------------------------------------------------------------------
-# Server — proposed method
+# Server — proposed method (Algorithms 1 & 2)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -285,6 +323,14 @@ class ServerConfig:
 
 
 class FLServer:
+    """
+    FL server implementing:
+      - Algorithm 1: Secure aggregation of encrypted gradients
+      - Algorithm 2: Byzantine-resilient encrypted client selection
+
+    The server never sees plaintext gradients. Client selection operates
+    on decrypted distance values only (Theorem 4.2).
+    """
 
     def __init__(
         self,
@@ -299,6 +345,7 @@ class FLServer:
         self.scheme = scheme
         self.ops = HomomorphicOps(scheme)
         self.round_metrics: List[dict] = []
+        self._debug_rounds: int = 0
 
     # ------------------------------------------------------------------
     # Byzantine-resilient client selection
@@ -328,7 +375,7 @@ class FLServer:
         if len(client_ids) <= n_select:
             return client_ids
 
-        # Decrypt distances
+        # Decrypt distances only (not gradients) — server learns distances, not updates
         distances: Dict[int, float] = {}
         ref_id = client_ids[0]
         ref_ct = client_updates[ref_id]
@@ -355,7 +402,7 @@ class FLServer:
         return selected[:n_select]
 
     # ------------------------------------------------------------------
-    # Secure aggregation
+    # Algorithm 1: Secure aggregation
     # ------------------------------------------------------------------
 
     def aggregate(
@@ -385,7 +432,8 @@ class FLServer:
             dataset_sizes[cid] / total_samples for cid in selected_ids
         ]
 
-        # Weighted sum in encrypted domain
+        # Weighted sum in encrypted domain — chunking handled transparently
+        # by HomomorphicOps and CKKSScheme.decrypt
         agg_ct = self.ops.he_weighted_sum(selected_updates, weights)
         return self.scheme.decrypt(agg_ct)
 
@@ -393,9 +441,12 @@ class FLServer:
     # Model update
     # ------------------------------------------------------------------
 
-    def apply_update(self, delta: np.ndarray) -> None:
+    def apply_update(self, delta: np.ndarray, debug: bool = False) -> None:
         """Apply aggregated gradient update to global model."""
-        flat = self._get_flat_params()
+        if debug:
+            print(f"  [DEBUG server] aggregated delta_norm={float(np.linalg.norm(delta)):.6f}"
+                  f"  delta_max={float(np.max(np.abs(delta))):.6f}")
+        flat    = self._get_flat_params()
         updated = flat + torch.tensor(delta, dtype=torch.float32)
         self._set_flat_params(updated)
 
@@ -449,7 +500,7 @@ class FLServer:
 
 
 # ---------------------------------------------------------------------------
-# FedAvg baseline server
+# FedAvg baseline server (no encryption, no Byzantine defense)
 # ---------------------------------------------------------------------------
 
 class FedAvgServer:
@@ -522,6 +573,15 @@ class FedAvgServer:
 # ---------------------------------------------------------------------------
 
 class FederatedRound:
+    """
+    Coordinates one complete FL round:
+      1. Server broadcasts global model
+      2. Selected clients train locally and return encrypted updates
+      3. Server filters (Algorithm 2) and aggregates (Algorithm 1)
+      4. Server applies update and evaluates
+
+    Works for both FLServer (proposed) and FedAvgServer (baseline).
+    """
 
     def __init__(
         self,
@@ -574,7 +634,7 @@ class FederatedRound:
 
         # Aggregate
         if self.use_fedavg:
-            # FedAvg
+            # FedAvg: decrypt on the fly (updates are already np.ndarray for FedAvg clients)
             plain_deltas = {
                 cid: self.scheme.decrypt(ct) if isinstance(ct, Ciphertext)
                      else ct
@@ -582,13 +642,16 @@ class FederatedRound:
             }
             delta = self.server.aggregate(plain_deltas, sizes)
         else:
-            # Proposed
+            # Proposed: Byzantine selection then encrypted aggregation
             n_select = max(self.server.config.min_clients_per_round,
                            int(n_participate * 0.8))
             selected = self.server.select_clients(updates, n_select)
             delta = self.server.aggregate(updates, sizes, selected)
 
-        self.server.apply_update(delta)
+        debug_round = hasattr(self.server, 'config') and getattr(self.server, '_debug_rounds', 0) < 3
+        self.server.apply_update(delta, debug=debug_round)
+        if debug_round and hasattr(self.server, '_debug_rounds'):
+            self.server._debug_rounds = getattr(self.server, '_debug_rounds', 0) + 1
 
         # Evaluate
         metrics = {
@@ -704,7 +767,8 @@ def _test_case_2_taylor_fl_round(simulate: bool):
     val_ds      = _make_tiny_dataset(256, n_classes)
     coordinator = FederatedRound(server, clients, ckks_params, scheme, use_fedavg=False)
 
-    # Verify client uses Taylor gradient
+    # Verify client uses Taylor gradient: check that diagonal Hessian
+    # is being computed by inspecting the eg.taylor.hessian method
     assert isinstance(clients[0].eg.taylor.hessian, DiagonalHessian),         "Client not using DiagonalHessian."
     print(f"  Client uses DiagonalHessian: OK")
 
@@ -812,6 +876,7 @@ def _test_case_3_taylor_vs_fedavg_under_attack(simulate: bool):
     print(f"  Proposed final acc: {proposed_accs[-1]:.4f}  "
           f"FedAvg final acc: {fedavg_accs[-1]:.4f}")
 
+    # Proposed should be at least as stable as FedAvg under attack
     assert proposed_std <= fedavg_std + 0.05,         f"Proposed (std={proposed_std:.4f}) much worse than FedAvg (std={fedavg_std:.4f})."
 
     print("  PASSED")
