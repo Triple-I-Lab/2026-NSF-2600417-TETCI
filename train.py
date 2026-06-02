@@ -109,6 +109,7 @@ def run_train(
           f"attack={args.attack}({args.attack_rate:.0%})")
 
     # Data
+    print(f"  Loading data...")
     client_loaders, val_loader, test_loader = get_dataloaders(
         dataset_name=args.dataset,
         n_clients=args.clients,
@@ -116,6 +117,9 @@ def run_train(
         batch_size=32,
         seed=args.seed,
     )
+    print(f"  Data loaded: {len(client_loaders)} clients, "
+          f"val={len(val_loader.dataset)}, test={len(test_loader.dataset)}")
+    print(f"  Building model and clients...")
 
     # Model
     base_model = build_model(model_name, dataset=args.dataset)
@@ -215,22 +219,13 @@ def run_ablation(
     ckks_params: CKKSParams,
     scheme: CKKSScheme,
 ) -> Dict:
-    """
-    Ablation study: 5 variants isolating each component.
 
-    V1 — FedAvg baseline (no HE, no Byzantine selection, no diagonal approx)
-    V2 — FedAvg + diagonal Hessian approximation only
-    V3 — FedAvg + Byzantine selection only
-    V4 — FedAvg + CKKS encryption only
-    V5 — Full proposed method (diagonal + Byzantine + CKKS)
-
-    Attack: 20% Byzantine, random-position (hardest scenario).
-    """
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     print(f"\n[ablation] model={model_name}  20% Byzantine random attack")
 
+    print(f"  Loading data...")
     client_loaders, val_loader, test_loader = get_dataloaders(
         dataset_name=args.dataset,
         n_clients=args.clients,
@@ -238,6 +233,9 @@ def run_ablation(
         batch_size=32,
         seed=args.seed,
     )
+    print(f"  Data loaded: {len(client_loaders)} clients, "
+          f"val={len(val_loader.dataset)}, test={len(test_loader.dataset)}")
+    print(f"  Building model and clients...")
 
     base_model = build_model(model_name, dataset=args.dataset)
     val_ds  = val_loader.dataset
@@ -304,11 +302,9 @@ def run_ablation(
                 acc_list.append(acc)
 
             _, clean_acc  = server.evaluate(val_ds)
-            # Attack drop: difference between max acc and final acc
             attack_drop = max(acc_list) - acc_list[-1]
 
         else:
-            # Use proposed FL server with Byzantine selection
             server_cfg = ServerConfig(
                 n_clients=args.clients,
                 participation_rate=0.4,
@@ -358,6 +354,7 @@ def run_compare(
     print(f"\n[compare] model={model_name}  "
           f"attack={args.attack}({args.attack_rate:.0%})")
 
+    print(f"  Loading data...")
     client_loaders, val_loader, test_loader = get_dataloaders(
         dataset_name=args.dataset,
         n_clients=args.clients,
@@ -365,6 +362,9 @@ def run_compare(
         batch_size=32,
         seed=args.seed,
     )
+    print(f"  Data loaded: {len(client_loaders)} clients, "
+          f"val={len(val_loader.dataset)}, test={len(test_loader.dataset)}")
+    print(f"  Building model and clients...")
 
     base_model = build_model(model_name, dataset=args.dataset)
     val_ds  = val_loader.dataset
@@ -560,7 +560,7 @@ def _test_case_2_short_train_run(simulate: bool):
             "train.py",
             "--model",   "cnn",
             "--dataset", "fmnist",
-            "--mode",    "simulate_he",   # always fast for self-test
+            "--mode",    "simulate_he", 
             "--rounds",  "3",
             "--clients", "4",
             "--epochs",  "2",
@@ -569,7 +569,6 @@ def _test_case_2_short_train_run(simulate: bool):
 
         rio         = RunIO(run_tag="selftest_train", base_dir=Path(tmpdir))
         ckks_params = CKKSParams.from_security_level(128)
-        # Always simulate_he in self-test — real CKKS is too slow for CI
         scheme      = CKKSScheme(params=ckks_params, simulate=True)
         args.mode   = "simulate_he"
 
@@ -595,7 +594,7 @@ def _test_case_3_compare_run(simulate: bool):
     both methods complete and return valid accuracy histories.
     """
     mode_label = "simulate_he" if simulate else "tenseal"
-    print(f"\n=== Test 3: Compare run [{mode_label}] ===")
+    print(f"\n=== Test 3: Compare run (proposed vs FedAvg)  [{mode_label}] ===")
 
     import sys, tempfile
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -634,15 +633,14 @@ def _test_case_3_compare_run(simulate: bool):
 
 if __name__ == "__main__":
     import sys
-
-    # Detect if running as self-test (no meaningful args beyond --mode)
     is_test = (
         len(sys.argv) == 1
-        or (len(sys.argv) == 3 and sys.argv[1] == "--mode")
+        or "--test" in sys.argv
     )
 
     if is_test:
         parser = argparse.ArgumentParser()
+        parser.add_argument("--test", action="store_true")
         parser.add_argument("--mode", choices=["simulate_he", "tenseal"],
                             default="tenseal")
         mode_args, _ = parser.parse_known_args()

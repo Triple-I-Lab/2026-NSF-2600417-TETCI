@@ -2,24 +2,6 @@
 federated.py
 ============
 Federated learning orchestration for the FL-HE framework.
-
-Covers:
-  - FLClient          : local training with encrypted gradient updates (Algorithm 3)
-  - FLServer          : global aggregation with Byzantine-resilient client selection
-                        (Algorithms 1 & 2)
-  - FedAvgServer      : plain FedAvg baseline (no encryption, no Byzantine defense)
-  - FederatedRound    : single round coordinator (select → train → aggregate → update)
-  - RunIO             : input/output folder management with run tags
-
-Paper references:
-  Algorithm 1 — Secure FL-HE communication protocol
-  Algorithm 2 — Byzantine-resilient encrypted client selection
-  Algorithm 3 — Privacy-preserving diagonal gradient approximation (in gradient_method.py)
-  Theorem  4.2 — Byzantine resilience bound
-  Section  V-A — Experimental setup (40% participation, 100 clients, 100 rounds)
-
-Run this file directly for 3 built-in test cases:
-  python federated.py [--mode simulate_he | tenseal]
 """
 
 from __future__ import annotations
@@ -148,16 +130,6 @@ class ClientConfig:
 class FLClient:
     """
     Federated learning client with encrypted gradient updates.
-
-    Responsibilities:
-      1. Receive global model parameters from server
-      2. Train locally for n_local_epochs using Taylor-based diagonal gradient
-      3. Encrypt the gradient update (Algorithm 3)
-      4. Return encrypted update to server
-
-    Byzantine clients inject Gaussian noise into their updates at
-    specified epochs (fixed-position) or random intervals (random-position),
-    matching the attack scenarios in Section V-A of the paper.
     """
 
     def __init__(
@@ -190,13 +162,6 @@ class FLClient:
         """
         Run local training using Taylor-based diagonal gradient approximation
         and return the encrypted accumulated gradient update.
-
-        For each epoch and each batch:
-          1. Build ModelLossWrapper around current model state + batch
-          2. Compute gradient via direct backprop (fast path)
-          3. Compute diagonal Hessian via finite differences
-          4. Apply Taylor gradient step: θ ← θ - lr*(∇L + D*(θ-θ_t))
-        After all local epochs, encrypt Δθ = θ_final - θ_global and return.
         """
         self._local_round = current_round
         theta_t   = self._get_flat_params().clone()
@@ -209,23 +174,38 @@ class FLClient:
             shuffle=True,
         )
 
+        # Compute diagonal Hessian once per round
+        first_batch = next(iter(loader))
+        x_init, y_init = first_batch
+        wrapper_init  = ModelLossWrapper(self.model, x_init, y_init, criterion)
+        loss_fn_h     = wrapper_init.as_loss_fn_for_hessian()
+        theta_cur_init = wrapper_init.get_flat_params().double()
+        diag_t = self.eg.taylor.hessian.compute_diagonal(
+            loss_fn_h, theta_cur_init, wrapper=wrapper_init
+        )
+
         for epoch in range(self.config.n_local_epochs):
             for x_batch, y_batch in loader:
-                wrapper  = ModelLossWrapper(self.model, x_batch, y_batch, criterion)
+                wrapper   = ModelLossWrapper(self.model, x_batch, y_batch, criterion)
                 theta_cur = wrapper.get_flat_params().double()
 
                 # Fast gradient via backprop
                 grad_t = wrapper.compute_gradient_direct().double()
 
-                # Diagonal Hessian via finite differences (eval mode for BatchNorm)
-                loss_fn_h = wrapper.as_loss_fn_for_hessian()
-                diag_t    = self.eg.taylor.hessian.compute_diagonal(
-                    loss_fn_h, theta_cur
-                )
+                # Taylor correction
+                max_diag    = 10.0
+                diag_clip   = diag_t.clamp(0.0, max_diag)
+                delta_theta = theta_cur - theta_t.double()
+                correction  = diag_clip * delta_theta
 
                 # Taylor gradient: ∇̃L = ∇L(θ_t) + D(θ_t)*(θ - θ_t)
-                delta_theta = theta_cur - theta_t.double()
-                approx_grad = grad_t + diag_t * delta_theta
+                approx_grad = grad_t + correction
+
+                # Clip gradient norm to prevent explosion
+                grad_norm = approx_grad.norm()
+                max_norm  = 1.0
+                if grad_norm > max_norm:
+                    approx_grad = approx_grad * (max_norm / grad_norm)
 
                 # Parameter update
                 theta_new = theta_cur - lr * approx_grad
@@ -246,7 +226,7 @@ class FLClient:
         return len(self.dataset)
 
     # ------------------------------------------------------------------
-    # Attack injection (Section V-A)
+    # Attack injection
     # ------------------------------------------------------------------
 
     def _inject_attack(self, delta: np.ndarray, current_round: int) -> np.ndarray:
@@ -291,7 +271,7 @@ class FLClient:
 
 
 # ---------------------------------------------------------------------------
-# Server — proposed method (Algorithms 1 & 2)
+# Server — proposed method
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -305,14 +285,6 @@ class ServerConfig:
 
 
 class FLServer:
-    """
-    FL server implementing:
-      - Algorithm 1: Secure aggregation of encrypted gradients
-      - Algorithm 2: Byzantine-resilient encrypted client selection
-
-    The server never sees plaintext gradients. Client selection operates
-    on decrypted distance values only (Theorem 4.2).
-    """
 
     def __init__(
         self,
@@ -329,7 +301,7 @@ class FLServer:
         self.round_metrics: List[dict] = []
 
     # ------------------------------------------------------------------
-    # Algorithm 2: Byzantine-resilient client selection
+    # Byzantine-resilient client selection
     # ------------------------------------------------------------------
 
     def select_clients(
@@ -356,7 +328,7 @@ class FLServer:
         if len(client_ids) <= n_select:
             return client_ids
 
-        # Decrypt distances only (not gradients) — server learns distances, not updates
+        # Decrypt distances
         distances: Dict[int, float] = {}
         ref_id = client_ids[0]
         ref_ct = client_updates[ref_id]
@@ -383,7 +355,7 @@ class FLServer:
         return selected[:n_select]
 
     # ------------------------------------------------------------------
-    # Algorithm 1: Secure aggregation
+    # Secure aggregation
     # ------------------------------------------------------------------
 
     def aggregate(
@@ -413,8 +385,7 @@ class FLServer:
             dataset_sizes[cid] / total_samples for cid in selected_ids
         ]
 
-        # Weighted sum in encrypted domain — chunking handled transparently
-        # by HomomorphicOps and CKKSScheme.decrypt
+        # Weighted sum in encrypted domain
         agg_ct = self.ops.he_weighted_sum(selected_updates, weights)
         return self.scheme.decrypt(agg_ct)
 
@@ -478,7 +449,7 @@ class FLServer:
 
 
 # ---------------------------------------------------------------------------
-# FedAvg baseline server (no encryption, no Byzantine defense)
+# FedAvg baseline server
 # ---------------------------------------------------------------------------
 
 class FedAvgServer:
@@ -551,15 +522,6 @@ class FedAvgServer:
 # ---------------------------------------------------------------------------
 
 class FederatedRound:
-    """
-    Coordinates one complete FL round:
-      1. Server broadcasts global model
-      2. Selected clients train locally and return encrypted updates
-      3. Server filters (Algorithm 2) and aggregates (Algorithm 1)
-      4. Server applies update and evaluates
-
-    Works for both FLServer (proposed) and FedAvgServer (baseline).
-    """
 
     def __init__(
         self,
@@ -612,7 +574,7 @@ class FederatedRound:
 
         # Aggregate
         if self.use_fedavg:
-            # FedAvg: decrypt on the fly (updates are already np.ndarray for FedAvg clients)
+            # FedAvg
             plain_deltas = {
                 cid: self.scheme.decrypt(ct) if isinstance(ct, Ciphertext)
                      else ct
@@ -620,7 +582,7 @@ class FederatedRound:
             }
             delta = self.server.aggregate(plain_deltas, sizes)
         else:
-            # Proposed: Byzantine selection then encrypted aggregation
+            # Proposed
             n_select = max(self.server.config.min_clients_per_round,
                            int(n_participate * 0.8))
             selected = self.server.select_clients(updates, n_select)
@@ -742,8 +704,7 @@ def _test_case_2_taylor_fl_round(simulate: bool):
     val_ds      = _make_tiny_dataset(256, n_classes)
     coordinator = FederatedRound(server, clients, ckks_params, scheme, use_fedavg=False)
 
-    # Verify client uses Taylor gradient: check that diagonal Hessian
-    # is being computed by inspecting the eg.taylor.hessian method
+    # Verify client uses Taylor gradient
     assert isinstance(clients[0].eg.taylor.hessian, DiagonalHessian),         "Client not using DiagonalHessian."
     print(f"  Client uses DiagonalHessian: OK")
 
@@ -851,7 +812,6 @@ def _test_case_3_taylor_vs_fedavg_under_attack(simulate: bool):
     print(f"  Proposed final acc: {proposed_accs[-1]:.4f}  "
           f"FedAvg final acc: {fedavg_accs[-1]:.4f}")
 
-    # Proposed should be at least as stable as FedAvg under attack
     assert proposed_std <= fedavg_std + 0.05,         f"Proposed (std={proposed_std:.4f}) much worse than FedAvg (std={fedavg_std:.4f})."
 
     print("  PASSED")

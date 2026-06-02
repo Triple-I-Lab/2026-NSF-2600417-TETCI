@@ -2,20 +2,6 @@
 gradient_method.py
 ==================
 Taylor-based diagonal Hessian approximation for the FL-HE framework.
-
-Covers:
-  - DiagonalHessian     : computes D_i(θ) = diag(∇²L_i(θ)) via finite differences
-                          or autograd; validates β < 0.5
-  - TaylorGradient      : second-order Taylor expansion
-                          ∇̃L_i(θ) = ∇L_i(θ_t) + D_i(θ_t)(θ - θ_t)
-  - ModelLossWrapper    : bridges nn.Module + DataLoader to the flat-param
-                          callable expected by DiagonalHessian / TaylorGradient
-  - EncryptedGradient   : wraps TaylorGradient to operate on CKKS ciphertexts;
-                          depth cost = 3 per layer
-  - ConvergenceTracker  : monitors ρ-rate bound and logs loss gap across FL rounds
-
-Run this file directly for 3 built-in test cases:
-  python gradient_method.py [--mode simulate_he | tenseal]
 """
 
 from __future__ import annotations
@@ -56,12 +42,6 @@ class DiagonalHessian:
     The diagonal dominance parameter β is estimated as:
         β = ||H - D|| / ||H||
     where H is the full Hessian and D = diag(H).
-
-    For encrypted operation, only the diagonal elements are needed, so
-    'finite_diff' is the default (avoids materialising the full Hessian).
-
-    Paper condition (Theorem 3.1): β < 0.5 must hold throughout training.
-    Empirically validated in paper Fig. 6: β ≈ 0.27–0.43 across architectures.
     """
 
     def __init__(
@@ -90,28 +70,80 @@ class DiagonalHessian:
     # Public API
     # ------------------------------------------------------------------
 
+    MAX_FINITE_DIFF_PARAMS: int = 256   
+
     def compute_diagonal(
         self,
         loss_fn: Callable[[torch.Tensor], torch.Tensor],
         params: torch.Tensor,
+        wrapper=None,
     ) -> torch.Tensor:
         """
         Compute diag(∇²L(θ)) at the given parameter vector.
 
+        For small models (n <= MAX_FINITE_DIFF_PARAMS): exact finite differences.
+        For large models: Hutchinson estimator (2k backprop passes, k=4).
+
         Parameters
         ----------
-        loss_fn : Callable[[torch.Tensor], torch.Tensor]
-            Scalar loss as a function of a flat parameter vector.
-        params : torch.Tensor
-            Current parameter vector θ (1-D, requires_grad if autograd).
-
-        Returns
-        -------
-        torch.Tensor  shape (len(params),)  — diagonal Hessian elements
+        loss_fn : scalar loss callable
+        params  : flat parameter vector
+        wrapper : ModelLossWrapper instance (optional) — enables fast
+                  Hutchinson path via compute_gradient_direct()
         """
         if self.method == "autograd":
             return self._diagonal_autograd(loss_fn, params)
-        return self._diagonal_finite_diff(loss_fn, params)
+
+        n = len(params)
+        if n <= self.MAX_FINITE_DIFF_PARAMS:
+            return self._diagonal_finite_diff(loss_fn, params)
+
+        # Large model: Hutchinson estimator
+        return self._diagonal_finite_diff_subsampled(loss_fn, params, wrapper=wrapper)
+
+    def _diagonal_finite_diff_subsampled(
+        self,
+        loss_fn: Callable[[torch.Tensor], torch.Tensor],
+        params: torch.Tensor,
+        wrapper=None,
+    ) -> torch.Tensor:
+        """
+        Approximate diagonal Hessian via Hutchinson's estimator.
+
+        diag(H) ≈ (1/k) Σ v ⊙ Hv,  v ~ Rademacher{-1,+1}^n
+        Hv = (∇L(θ+εv) - ∇L(θ-εv)) / (2ε)
+
+        Cost: 2k gradient computations regardless of n_params.
+        """
+        k_samples  = 4
+        n          = len(params)
+        orig_dtype = params.dtype
+        p          = params.detach().float()
+        diag_est   = torch.zeros(n, dtype=torch.float32)
+        eps        = self.eps
+
+        def get_grad(x: torch.Tensor) -> torch.Tensor:
+            if wrapper is not None and hasattr(wrapper, 'compute_gradient_direct'):
+                orig = wrapper.get_flat_params().clone()
+                wrapper.set_flat_params(x)
+                g = wrapper.compute_gradient_direct()
+                wrapper.set_flat_params(orig)
+                return g.float()
+            # Fallback: autograd on flat param
+            x_req = x.detach().requires_grad_(True)
+            loss  = loss_fn(x_req)
+            g     = torch.autograd.grad(loss, x_req, allow_unused=True)[0]
+            return (g if g is not None else torch.zeros_like(x)).detach()
+
+        for _ in range(k_samples):
+            v       = torch.randint(0, 2, (n,)).float() * 2 - 1
+            g_plus  = get_grad(p + eps * v)
+            g_minus = get_grad(p - eps * v)
+            Hv      = (g_plus - g_minus) / (2 * eps)
+            diag_est += v * Hv
+
+        diag_est = diag_est / k_samples
+        return diag_est.to(orig_dtype)
 
     def estimate_beta(
         self,
@@ -120,9 +152,6 @@ class DiagonalHessian:
     ) -> float:
         """
         Estimate the diagonal dominance parameter β.
-
-        Uses autograd for the full Hessian (only feasible for small models /
-        test cases).  For large models, β is estimated from a random subspace.
 
         Returns
         -------
@@ -166,10 +195,7 @@ class DiagonalHessian:
         Multiplicative depth cost in HE: 2 per element (paper Section III-B).
         Total depth for layer: 2 (diag) + 1 (mat-vec) = 3.
         """
-        # Cast to float64 to avoid catastrophic cancellation in
-        # L(θ+ε) - 2L(θ) + L(θ-ε) when loss magnitude >> ε²
-        # Wrap loss_fn so it casts input back to original dtype before
-        # calling the user function (which may capture float32 tensors).
+
         orig_dtype = params.dtype
         def loss64(x: torch.Tensor) -> torch.Tensor:
             return loss_fn(x.to(orig_dtype)).double()
@@ -249,7 +275,7 @@ class DiagonalHessian:
 
 
 # ---------------------------------------------------------------------------
-# Taylor gradient approximation (Lemma 3.1)
+# Taylor gradient approximation
 # ---------------------------------------------------------------------------
 
 class TaylorGradient:
@@ -300,8 +326,6 @@ class TaylorGradient:
         if use_cache and cache_key in self._cache:
             grad_t, diag_t = self._cache[cache_key]
         else:
-            # Fast path: if loss_fn is from a ModelLossWrapper, use direct
-            # backprop for the gradient (avoids n_params forward passes)
             wrapper = getattr(loss_fn, '__self__', None)
             if hasattr(loss_fn, '__func__') and hasattr(wrapper, 'compute_gradient_direct'):
                 grad_t = wrapper.compute_gradient_direct().to(theta_t.dtype)
@@ -352,16 +376,11 @@ class TaylorGradient:
         """
         Compute ∇L(θ) via autograd if the loss graph includes the flat
         param tensor, otherwise fall back to central finite differences.
-
-        The flat-param interface used by ModelLossWrapper temporarily injects
-        params into the model then runs forward — the flat tensor itself is
-        not in the autograd graph, so autograd.grad fails.  Finite differences
-        work correctly in both cases.
         """
         p = params.detach().requires_grad_(True)
         loss = loss_fn(p)
 
-        # Try autograd first (fast, exact for simple functions)
+        # Try autograd first 
         try:
             grad = torch.autograd.grad(loss, p, allow_unused=True)[0]
             if grad is not None:
@@ -369,7 +388,7 @@ class TaylorGradient:
         except RuntimeError:
             pass
 
-        # Fall back to central finite differences (works for ModelLossWrapper)
+        # Fall back to central finite differences 
         eps = 1e-4
         orig_dtype = params.dtype
         p64 = params.double()
@@ -387,33 +406,12 @@ class TaylorGradient:
 
 
 # ---------------------------------------------------------------------------
-# Encrypted gradient (Algorithm 3)
+# Encrypted gradient
 # ---------------------------------------------------------------------------
 
 class EncryptedGradient:
-    """
-    Implements Algorithm 3 (Privacy-preserving diagonal gradient approximation)
-    operating on CKKS ciphertexts.
 
-    Flow per local training step:
-      1. Encrypt current parameters θ_t  -> ct_theta_t
-      2. Compute ∇L(θ_t) in plaintext, encrypt -> ct_grad
-      3. Compute D(θ_t) in plaintext, encrypt  -> ct_diag
-      4. Homomorphically compute:
-             ct_approx = ct_grad ⊕ (ct_diag ⊙ (ct_theta - ct_theta_t))
-         Total multiplicative depth: 3 (depth 2 for diag, depth 1 for mul)
-      5. Return ct_approx for transmission to server
-
-    Step 2–3 happen in plaintext on the client device (data never leaves).
-    Only the encrypted gradient ct_approx is sent out.
-
-    Parameters
-    ----------
-    scheme  : CKKSScheme
-    taylor  : TaylorGradient
-    """
-
-    DEPTH_PER_LAYER = 3   # paper Section III-B
+    DEPTH_PER_LAYER = 3 
 
     def __init__(self, scheme: CKKSScheme, taylor: Optional[TaylorGradient] = None):
         self.scheme = scheme
@@ -426,20 +424,7 @@ class EncryptedGradient:
         theta_t: torch.Tensor,
         theta: torch.Tensor,
     ) -> Ciphertext:
-        """
-        Compute and encrypt the Taylor-approximated gradient.
-
-        Parameters
-        ----------
-        loss_fn : scalar loss callable (runs on client's local data)
-        theta_t : current global model parameters (flat tensor)
-        theta   : local model parameters after local update (flat tensor)
-
-        Returns
-        -------
-        Ciphertext  encrypted approximated gradient (ready for server aggregation)
-        """
-        # Plaintext Taylor gradient (computed locally, never transmitted raw)
+        # Plaintext Taylor gradient 
         approx_grad = self.taylor.compute(loss_fn, theta_t, theta)
         grad_np = approx_grad.detach().cpu().numpy()
 
@@ -475,31 +460,10 @@ class EncryptedGradient:
 
 
 # ---------------------------------------------------------------------------
-# Model loss wrapper — bridges nn.Module to flat-param callable
+# Model loss wrapper
 # ---------------------------------------------------------------------------
 
 class ModelLossWrapper:
-    """
-    Wraps an nn.Module and a data batch into a flat-parameter callable
-    compatible with DiagonalHessian and TaylorGradient.
-
-    This is the bridge that allows the Taylor gradient to operate on real
-    neural networks rather than toy quadratic functions.
-
-    Usage
-    -----
-    wrapper = ModelLossWrapper(model, x_batch, y_batch, criterion)
-    loss_fn = wrapper.as_loss_fn()           # flat_params -> scalar loss
-    flat_t  = wrapper.get_flat_params()      # current θ_t
-    wrapper.set_flat_params(flat_updated)    # apply updated params back
-
-    BatchNorm handling
-    ------------------
-    BatchNorm uses batch statistics during training that change with each
-    forward pass, making finite-difference Hessian estimates noisy.
-    During Hessian computation the model is switched to eval mode so
-    running stats are used instead, then restored to train mode.
-    """
 
     def __init__(
         self,
@@ -585,7 +549,7 @@ class ModelLossWrapper:
         return self.as_loss_fn(eval_mode=True)
 
     # ------------------------------------------------------------------
-    # Taylor gradient — convenience method
+    # Taylor gradient
     # ------------------------------------------------------------------
 
     def compute_taylor_gradient(
@@ -607,11 +571,6 @@ class ModelLossWrapper:
         return self._total_params
 
     def compute_gradient_direct(self) -> torch.Tensor:
-        """
-        Compute gradient directly through model parameters via backprop.
-        Much faster than finite differences for the gradient (not the Hessian).
-        Used by TaylorGradient when called through ModelLossWrapper.
-        """
         self.model.zero_grad()
         out  = self.model(self.x_batch)
         loss = self.criterion(out, self.y_batch)
@@ -642,7 +601,7 @@ class ConvergenceState:
 
 class ConvergenceTracker:
     """
-    Monitors convergence of the FL-HE system against Theorem 3.1 predictions.
+    Monitors convergence of the FL-HE system
 
     Usage
     -----
@@ -741,9 +700,6 @@ class ConvergenceTracker:
         return state
 
     def predicted_loss_gap(self, round_idx: int, initial_gap: float) -> float:
-        """
-        Theorem 3.1 prediction: L(θ^t) - L(θ*) ≤ ρ^t · initial_gap + neighborhood.
-        """
         rho = self.noise_analysis.convergence_rate(self.eta, self.mu, self.beta)
         t = max(round_idx, 0)
         noise_bound = self.noise_analysis.round_noise_bound(
@@ -819,9 +775,9 @@ def _test_case_1_model_loss_wrapper(simulate: bool):
     print(f"  set/get round-trip error: {err:.2e}  (should be ~0)")
     assert err < 1e-6, f"Round-trip error {err:.2e} too large."
 
-    # Model params restored after loss_fn call (no side effects)
+    # Model params restored after loss_fn call
     wrapper.set_flat_params(flat_orig)
-    _ = loss_fn(perturbed)   # should not modify model permanently
+    _ = loss_fn(perturbed)  
     flat_after = wrapper.get_flat_params()
     err2 = float(torch.max(torch.abs(flat_after - flat_orig)))
     print(f"  Model params unchanged after loss_fn call: err={err2:.2e}")
@@ -830,7 +786,7 @@ def _test_case_1_model_loss_wrapper(simulate: bool):
     # Diagonal Hessian works through the wrapper
     dh  = DiagonalHessian(method="finite_diff", eps=1e-4)
     loss_fn_h = wrapper.as_loss_fn_for_hessian()
-    diag = dh.compute_diagonal(loss_fn_h, flat.double())
+    diag = dh.compute_diagonal(loss_fn_h, flat.double(), wrapper=wrapper)
     assert diag.shape == flat.shape, "Diagonal shape mismatch."
     assert not torch.all(diag == 0), "All-zero diagonal — something is wrong."
     print(f"  Diagonal Hessian shape: {diag.shape}  "
@@ -858,17 +814,13 @@ def _test_case_2_taylor_gradient_on_model(simulate: bool):
     theta_t  = wrapper.get_flat_params().clone()
     loss_fn  = wrapper.as_loss_fn_for_hessian()
 
-    # Taylor gradient — use direct backprop for gradient,
-    # finite diff only for diagonal Hessian (much faster)
+    # Taylor gradient
     tg        = TaylorGradient(DiagonalHessian(method="finite_diff"))
     theta_t_d = theta_t.double()
     theta     = theta_t_d.clone()
-
-    # Use wrapper's direct gradient method bound to loss_fn
-    # so TaylorGradient can detect and use the fast path
     grad_direct = wrapper.compute_gradient_direct().double()
     diag_t      = DiagonalHessian(method="finite_diff").compute_diagonal(
-                      loss_fn, theta_t_d
+                      loss_fn, theta_t_d, wrapper=wrapper
                   )
     delta       = theta - theta_t_d
     approx_grad = grad_direct + diag_t * delta
@@ -907,8 +859,6 @@ def _test_case_3_convergence_on_model(simulate: bool):
     """
     Test 3 — Full training loop using ModelLossWrapper + TaylorGradient:
     run 10 gradient steps on a tiny model and verify loss decreases overall.
-    This is the closest test to what FLClient.local_train() will do in
-    Option A.
     """
     mode_label = "simulate_he" if simulate else "tenseal"
     print(f"\n=== Test 3: Training loop via Taylor gradient  [{mode_label}] ===")
@@ -932,7 +882,7 @@ def _test_case_3_convergence_on_model(simulate: bool):
         # Fast gradient via backprop, diagonal Hessian via finite diff
         grad_t  = wrapper.compute_gradient_direct().double()
         diag_t  = DiagonalHessian(method="finite_diff").compute_diagonal(
-                      loss_fn, theta_t
+                      loss_fn, theta_t, wrapper=wrapper
                   )
         # Taylor step: ∇̃L = ∇L(θ_t) + D(θ_t) * (θ - θ_t)
         # At θ = θ_t the correction is zero, so update is just -lr * grad_t
