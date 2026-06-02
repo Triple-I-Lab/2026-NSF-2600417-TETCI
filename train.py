@@ -1,30 +1,21 @@
 """
-train.py
-========
-Main entry point for the FL-HE framework.
-
-Usage examples:
-  python train.py                                          # defaults
-  python train.py --model cnn --dataset fmnist
-  python train.py --model all --experiment ablation
-  python train.py --experiment compare --attack fixed --attack_rate 0.2
-  python train.py --mode simulate_he --clients 10 --rounds 20
-  python train.py --resume 20260601_001
+train.py — Main entry point for the FL-HE framework.
 
 CLI flags:
-  --model        cnn | vit | efficientnet | all        (default: cnn)
-  --dataset      fmnist                                (default: fmnist)
-  --mode         simulate_he | tenseal                 (default: simulate_he)
-  --experiment   train | ablation | compare            (default: train)
-  --attack       none | fixed | random                 (default: none)
-  --attack_rate  float 0.0-0.5                         (default: 0.1)
-  --clients      int                                   (default: 10)
-  --rounds       int                                   (default: 20)
-  --epochs       int  local epochs per round           (default: 5)
-  --security     128 | 192 | 256                       (default: 128)
-  --run_tag      str  (default: auto YYYYMMDD_NNN)
+  --model        cnn | vit | efficientnet | all   (default: cnn)
+  --dataset      fmnist                           (default: fmnist)
+  --mode         simulate_he | tenseal            (default: simulate_he)
+  --experiment   train | ablation | compare       (default: train)
+  --attack       none | fixed | random            (default: none)
+  --attack_rate  0.0-0.5                          (default: 0.1)
+  --clients      int                              (default: 10)
+  --rounds       int                              (default: 20)
+  --epochs       int                              (default: 5)
+  --security     128 | 192 | 256                  (default: 128)
+  --run_tag      str                              (default: auto YYYYMMDD_NNN)
   --resume       str  run_tag to resume from
-  --seed         int                                   (default: 42)
+  --seed         int                              (default: 42)
+  --test         run self-tests instead of training
 """
 
 from __future__ import annotations
@@ -40,6 +31,11 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
 
 from datasets import DatasetLoader, FederatedPartition, get_dataloaders
 from encryption import CKKSParams, CKKSScheme, TENSEAL_AVAILABLE
@@ -177,15 +173,37 @@ def run_train(
 
     val_ds = val_loader.dataset
     metrics_history = []
+    n_rounds = args.rounds - start_round
 
-    for r in range(start_round, args.rounds):
+    if TQDM_AVAILABLE:
+        pbar = tqdm(
+            range(start_round, args.rounds),
+            desc=f"  {model_name.upper()}",
+            unit="round",
+            ncols=90,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+        )
+        rounds_iter = pbar
+    else:
+        rounds_iter = range(start_round, args.rounds)
+
+    for r in rounds_iter:
         m = coordinator.run(r, val_dataset=val_ds, participation_rate=0.4)
         metrics_history.append(m)
 
-        print(f"  Round {r+1:3d}/{args.rounds}  "
-              f"val_loss={m.get('val_loss', 0):.4f}  "
-              f"val_acc={m.get('val_acc', 0):.4f}  "
-              f"t={m['duration_s']}s")
+        val_loss = m.get("val_loss", 0)
+        val_acc  = m.get("val_acc",  0)
+        dur      = m["duration_s"]
+
+        if TQDM_AVAILABLE:
+            pbar.set_postfix({
+                "loss": f"{val_loss:.4f}",
+                "acc":  f"{val_acc:.4f}",
+                "t":    f"{dur}s",
+            })
+        else:
+            print(f"  Round {r+1:3d}/{args.rounds}  "
+                  f"loss={val_loss:.4f}  acc={val_acc:.4f}  t={dur}s")
 
         # Checkpoint every 10 rounds
         if (r + 1) % 10 == 0:
@@ -219,7 +237,10 @@ def run_ablation(
     ckks_params: CKKSParams,
     scheme: CKKSScheme,
 ) -> Dict:
-
+    """
+    Ablation study
+    Attack: 20% Byzantine, random-position.
+    """
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -287,7 +308,9 @@ def run_ablation(
             clients = build_clients("random")
             acc_list = []
 
-            for r in range(args.rounds):
+            abl_iter = tqdm(range(args.rounds), desc=f"    {vname}", unit="round",
+                            ncols=80, leave=False) if TQDM_AVAILABLE else range(args.rounds)
+            for r in abl_iter:
                 global_p = server.get_model_params()
                 updates, sizes = {}, {}
                 for i, c in enumerate(clients):
@@ -300,11 +323,14 @@ def run_ablation(
                 server.apply_update(delta)
                 _, acc = server.evaluate(val_ds)
                 acc_list.append(acc)
+                if TQDM_AVAILABLE:
+                    abl_iter.set_postfix({"acc": f"{acc:.4f}"})
 
-            _, clean_acc  = server.evaluate(val_ds)
-            attack_drop = max(acc_list) - acc_list[-1]
+            _, clean_acc = server.evaluate(val_ds)
+            attack_drop  = max(acc_list) - acc_list[-1]
 
         else:
+            # Use proposed FL server with Byzantine selection
             server_cfg = ServerConfig(
                 n_clients=args.clients,
                 participation_rate=0.4,
@@ -320,9 +346,13 @@ def run_ablation(
                 server, clients, ckks_params, run_scheme, use_fedavg=False
             )
             acc_list = []
-            for r in range(args.rounds):
+            abl_iter = tqdm(range(args.rounds), desc=f"    {vname}", unit="round",
+                            ncols=80, leave=False) if TQDM_AVAILABLE else range(args.rounds)
+            for r in abl_iter:
                 m = coordinator.run(r, val_dataset=val_ds, participation_rate=0.4)
                 acc_list.append(m.get("val_acc", 0))
+                if TQDM_AVAILABLE:
+                    abl_iter.set_postfix({"acc": f"{acc_list[-1]:.4f}"})
 
             _, clean_acc = server.evaluate(val_ds)
             attack_drop = max(acc_list) - acc_list[-1]
@@ -411,10 +441,15 @@ def run_compare(
     )
 
     proposed_accs = []
-    for r in range(args.rounds):
+    prop_iter = tqdm(range(args.rounds), desc="  Proposed", unit="round",
+                     ncols=80) if TQDM_AVAILABLE else range(args.rounds)
+    for r in prop_iter:
         m = proposed_coord.run(r, val_dataset=val_ds, participation_rate=0.4)
         proposed_accs.append(m.get("val_acc", 0))
-        print(f"  [Proposed] Round {r+1:3d}  acc={proposed_accs[-1]:.4f}")
+        if TQDM_AVAILABLE:
+            prop_iter.set_postfix({"acc": f"{proposed_accs[-1]:.4f}"})
+        else:
+            print(f"  [Proposed] Round {r+1:3d}  acc={proposed_accs[-1]:.4f}")
 
     _, proposed_test_acc = proposed_server.evaluate(test_ds)
     results["proposed"] = {
@@ -425,9 +460,10 @@ def run_compare(
     # --- FedAvg ---
     fedavg_server  = FedAvgServer(copy.deepcopy(base_model))
     fedavg_clients = build_clients(base_model)
-    fedavg_accs    = []
-
-    for r in range(args.rounds):
+    fedavg_accs = []
+    fedavg_iter = tqdm(range(args.rounds), desc="  FedAvg  ", unit="round",
+                       ncols=80) if TQDM_AVAILABLE else range(args.rounds)
+    for r in fedavg_iter:
         global_p = fedavg_server.get_model_params()
         updates, sizes = {}, {}
         for i, c in enumerate(fedavg_clients):
@@ -439,7 +475,10 @@ def run_compare(
         fedavg_server.apply_update(delta)
         _, acc = fedavg_server.evaluate(val_ds)
         fedavg_accs.append(acc)
-        print(f"  [FedAvg]   Round {r+1:3d}  acc={fedavg_accs[-1]:.4f}")
+        if TQDM_AVAILABLE:
+            fedavg_iter.set_postfix({"acc": f"{acc:.4f}"})
+        else:
+            print(f"  [FedAvg]   Round {r+1:3d}  acc={acc:.4f}")
 
     _, fedavg_test_acc = fedavg_server.evaluate(test_ds)
     results["fedavg"] = {
@@ -560,7 +599,7 @@ def _test_case_2_short_train_run(simulate: bool):
             "train.py",
             "--model",   "cnn",
             "--dataset", "fmnist",
-            "--mode",    "simulate_he", 
+            "--mode",    "simulate_he",   # always fast for self-test
             "--rounds",  "3",
             "--clients", "4",
             "--epochs",  "2",
@@ -569,6 +608,7 @@ def _test_case_2_short_train_run(simulate: bool):
 
         rio         = RunIO(run_tag="selftest_train", base_dir=Path(tmpdir))
         ckks_params = CKKSParams.from_security_level(128)
+        # Always simulate_he in self-test — real CKKS is too slow for CI
         scheme      = CKKSScheme(params=ckks_params, simulate=True)
         args.mode   = "simulate_he"
 
