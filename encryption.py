@@ -3,19 +3,6 @@ encryption.py
 =============
 CKKS-based homomorphic encryption layer for the FL-HE framework.
 
-Covers:
-  - CKKSScheme      : parameter setup, key generation, encode/encrypt/decrypt
-  - HomomorphicOps  : add, subtract, scalar multiply, dot product over ciphertexts
-  - NoiseAnalysis   : Lemma 3.2 / Theorem 3.2 noise bound computation
-  - SimulatedCKKS   : statistically equivalent mock (no TenSEAL required) for
-                      fast iteration under --mode simulate_he
-
-Security parameter sets (Table II of paper):
-  128-bit  ->  poly_degree=4096,  coeff_mod_bit_sizes=[40,20,40]
-  192-bit  ->  poly_degree=8192,  coeff_mod_bit_sizes=[48,24,48]
-  256-bit  ->  poly_degree=16384, coeff_mod_bit_sizes=[56,28,56]
-
-Run this file directly for 3 built-in test cases:
   python encryption.py
 """
 
