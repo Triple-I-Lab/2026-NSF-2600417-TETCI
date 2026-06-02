@@ -1,0 +1,73 @@
+# FL-HE Framework Configuration
+# All values here are defaults; CLI flags override them.
+
+# ── Run ──────────────────────────────────────────────────────────────
+run:
+  seed: 42
+  run_tag: null          # null = auto YYYYMMDD_NNN
+  resume: null           # run_tag to resume from
+
+# ── Mode ─────────────────────────────────────────────────────────────
+mode:
+  encryption: simulate_he   # simulate_he | tenseal
+  security_bits: 128        # 128 | 192 | 256
+
+# ── Model ─────────────────────────────────────────────────────────────
+model:
+  name: cnn               # cnn | vit | efficientnet | all
+  dataset: fmnist         # fmnist (default)
+
+# ── Federated Learning ────────────────────────────────────────────────
+federated:
+  n_clients: 10           # total number of clients
+  participation_rate: 0.4 # fraction participating per round
+  rounds: 20              # number of FL rounds
+  local_epochs: 5         # local training epochs per round
+  batch_size: 32
+  learning_rate: 0.01
+  alpha: 0.5              # Dirichlet concentration for non-IID split
+  min_clients_per_round: 2
+
+# Full settings:
+# federated:
+#   n_clients: 100
+#   participation_rate: 0.4
+#   rounds: 100
+#   local_epochs: 100
+#   batch_size: 32
+#   learning_rate: 0.01
+#   alpha: 0.5
+#   min_clients_per_round: 4
+
+# ── Security / Byzantine ──────────────────────────────────────────────
+security:
+  distance_threshold: 2.0  # τ for Byzantine client filtering
+  attack: none             # none | fixed | random
+  attack_rate: 0.1         # fraction of Byzantine clients
+  attack_noise_std: 0.1    # Gaussian noise std for poisoning
+
+# ── CKKS Parameters ───────────────────────────────────────────────────
+ckks:
+  # Set automatically 
+  128:
+    poly_degree: 4096
+    coeff_mod_bit_sizes: [40, 20, 40]
+    scale_bits: 20
+  192:
+    poly_degree: 8192
+    coeff_mod_bit_sizes: [48, 24, 24, 48]
+    scale_bits: 24
+  256:
+    poly_degree: 16384
+    coeff_mod_bit_sizes: [56, 28, 28, 28, 56]
+    scale_bits: 28
+
+# ── Experiment ────────────────────────────────────────────────────────
+experiment:
+  type: train             # train | ablation | compare
+
+# ── Paths ─────────────────────────────────────────────────────────────
+paths:
+  data_root: inputs/raw_data
+  input_dir: inputs
+  output_dir: outputs
